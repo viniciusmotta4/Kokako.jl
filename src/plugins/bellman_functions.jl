@@ -58,13 +58,104 @@ function bellman_term(bellman::AbstractBellmanFunction)
     error("Kokako.bellman term not implemented for $(bellman).")
 end
 
-# ============================== SDDP.AverageCut ===============================
+# ============================== Cut Oracles ===============================
+
+abstract type AbstractCutOracle end
 
 mutable struct Cut
     intercept::Float64
     coefficients::Dict{Symbol, Float64}
     index
+    non_dominated_count::Int
+    Cut(intercept, coefficients, index) = new(intercept, coefficients, index, 0)
 end
+
+mutable struct SampledState
+    state::Dict{Symbol, Float64}
+    best_objective::Float64
+    best_cut_index::Int
+end
+
+"""
+    LevelOneCutOracle()
+
+# Description
+
+Initialize the cut oracle for Level One cut selection. See:
+
+V. de Matos, A. Philpott, E. Finardi, Improving the performance of Stochastic
+Dual Dynamic Programming, Journal of Computational and Applied Mathematics
+290 (2015) 196–208.
+"""
+mutable struct LevelOneCutOracle <: AbstractCutOracle
+    cuts::Vector{Cut}
+    states::Vector{SampledState}
+    sampled_states::Set{Dict{Symbol, Float64}}
+    LevelOneCutOracle() = new(Cut[], SampledState[], Set{Vector{Float64}}())
+end
+
+function add_cut_to_oracle(oracle::LevelOneCutOracle,
+                           model::PolicyGraph,
+                           subproblem::JuMP.Model,
+                           cut::Cut)
+    sense = getsense(subproblem)
+
+    # Loop through previously visited states comparing the new cut against the
+    # previous best. If it is strictly better, keep the new cut.
+    push!(oracle.cuts, cut)
+    cut_index = length(oracle.cuts)
+    for state in oracle.states
+        height = cut.intercept + dot(cut.coefficients, state.state)
+        if dominates(sense, height, state.best_objective)
+            # If new cut is strictly better decrement the counter at the
+            # previous best.
+            oracle.cuts[state.best_cut_index].non_dominated_count -= 1
+            # Increment the counter at the new cut.
+            oracle.cuts[cut_index].non_dominated_count += 1
+            state.best_cut_index = cut_index
+            state.best_objective = height
+        end
+    end
+
+    # get the last state
+    current_state = copy(getstage(model, ext(subproblem).stage).state)
+    if length(current_state) == 0
+        # This is a special case for the asynchronous algorithm where we're
+        # adding a cut but haven't seen a state yet, or for the case where we're
+        # loading cuts into a new model.
+        return
+    end
+
+    if current_state in oracle.sampled_states
+        return
+    end
+    push!(oracle.sampled_states, current_state)
+    # Now loop through the previously discovered cuts comparing them at the new
+    # sampled state. If the new cut is strictly better, keep it, otherwise keep
+    # the old cut.
+    sampled_state = SampledState(current_state,
+        cut.intercept + dot(cut.coefficients, current_state),
+        cut_index  # Assume that the new cut is the best.
+    )
+    push!(oracle.states, sampled_state)
+    oracle.cuts[cut_index].non_dominated_count += 1
+
+    for (index, stored_cut) in enumerate(oracle.cuts)
+        height = stored_cut.cut.intercept + dot(stored_cut.cut.coefficients,
+            sampled_state.state)
+        if dominates(sense, height, sampled_state.best_objective)
+            # If new cut is strictly better,  decrement the counter at the old
+            # cut.
+            oracle.cuts[sampled_state.best_cut_index].non_dominated_count -= 1
+            # Increment the counter at the new cut.
+            oracle.cuts[index].non_dominated_count += 1
+            sampled_state.best_cut_index = index
+            sampled_state.best_objective = height
+        end
+    end
+end
+
+# ============================== SDDP.AverageCut ===============================
 
 struct AverageCut <: AbstractBellmanFunction
     variable::JuMP.VariableRef
@@ -84,11 +175,6 @@ end
 The AverageCut Bellman function. Provide a lower_bound if minimizing, or an
 upper_bound if maximizing.
 """
-# function AverageCut(;
-#         lower_bound = -Inf,
-#         upper_bound = Inf,
-#         cut_improvement_tolerance::Float64 = 0.0
-#         )
 function AverageCut(; kwargs...)
     return BellmanFactory{AverageCut}(; kwargs...)
 end
