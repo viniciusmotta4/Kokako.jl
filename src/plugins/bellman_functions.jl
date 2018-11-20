@@ -60,16 +60,9 @@ end
 
 # ============================== SDDP.AverageCut ===============================
 
-mutable struct Cut
-    intercept::Float64
-    coefficients::Dict{Symbol, Float64}
-    index
-end
-
 struct AverageCut <: AbstractBellmanFunction
     variable::JuMP.VariableRef
     cut_improvement_tolerance::Float64
-    cuts::Vector{Cut}
 end
 
 struct BellmanFactory{T}
@@ -84,11 +77,6 @@ end
 The AverageCut Bellman function. Provide a lower_bound if minimizing, or an
 upper_bound if maximizing.
 """
-# function AverageCut(;
-#         lower_bound = -Inf,
-#         upper_bound = Inf,
-#         cut_improvement_tolerance::Float64 = 0.0
-#         )
 function AverageCut(; kwargs...)
     return BellmanFactory{AverageCut}(; kwargs...)
 end
@@ -121,7 +109,7 @@ function initialize_bellman_function(factory::BellmanFactory{AverageCut},
     else
         @variable(node.subproblem, lower_bound = 0, upper_bound = 0)
     end
-    return AverageCut(bellman_variable, cut_improvement_tolerance, Cut[])
+    return AverageCut(bellman_variable, cut_improvement_tolerance)
 end
 
 bellman_term(bellman::AverageCut) = bellman.variable
@@ -169,10 +157,6 @@ function refine_bellman_function(graph::PolicyGraph{T},
         intercept -= coefficients[name] * value
     end
 
-    # A structure to hold information about the cut. The third argument is
-    # `nothing` because we haven't added it to the model.
-    cut = Cut(intercept, coefficients, nothing)
-
     # Test whether we should add the new cut to the subproblem. We do this now
     # before collating the intercept to avoid twice the work.
     cut_is_an_improvement = if bellman_function.cut_improvement_tolerance > 0.0
@@ -192,10 +176,6 @@ function refine_bellman_function(graph::PolicyGraph{T},
                 intercept + sum(coefficients[name] * state.out
                     for (name, state) in node.states))
         end
-        # Store the index of the cut.
-        cut.index = index
     end
-    # Store the cut in the Bellman function.
-    push!(bellman_function.cuts, cut)
     return
 end
