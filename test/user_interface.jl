@@ -15,6 +15,7 @@ using Kokako, Test, GLPK
         end
         @test haskey(graph.nodes, 5)
         @test graph.nodes[5] == Tuple{Int, Float64}[]
+        @test length(graph.belief_partition) == 0
     end
 
     @testset "MarkovianGraph" begin
@@ -41,6 +42,8 @@ using Kokako, Test, GLPK
             ])
             @test graph_1.root_node == graph_2.root_node
             @test graph_1.nodes == graph_2.nodes
+            @test length(graph_1.belief_partition) == 0
+            @test length(graph_2.belief_partition) == 0
         end
     end
 
@@ -88,6 +91,29 @@ using Kokako, Test, GLPK
             Kokako.add_edge(graph, :root => :x, 0.5)
             Kokako.add_edge(graph, :root => :x, 0.75)
             @test_throws Exception Kokako.validate_graph(graph)
+        end
+        @testset "Belief partition" begin
+            graph = Kokako.Graph(:root)
+            Kokako.add_node(graph, :x)
+            Kokako.add_node(graph, :y)
+            Kokako.add_partition(graph, [:x])
+            Kokako.add_partition(graph, [:y])
+            @test graph.belief_partition == [ [:x], [:y] ]
+
+            graph = Kokako.Graph(:root, [:x, :y], [
+                (:root => :x, 0.5),
+                (:root => :y, 0.5),
+                ],
+                belief_partition = [ [:x, :y] ]
+            )
+            @test graph.belief_partition == [ [:x, :y] ]
+
+            graph = Kokako.Graph(:root, [:x, :y], [
+                (:root => :x, 0.5),
+                (:root => :y, 0.5),
+                ]
+            )
+            @test length(graph.belief_partition) == 0
         end
     end
 end
@@ -190,4 +216,45 @@ end
         @test node.stage_objective == 2 * node.subproblem[:x]
         @test model.objective_sense == Kokako.MOI.MaxSense
     end
+end
+
+@testset "Belief Updater" begin
+    graph = Kokako.LinearGraph(2)
+    Kokako.add_edge(graph, 2 => 1, 0.9)
+    model = Kokako.PolicyGraph(graph,direct_mode=false) do subproblem, node
+        beliefs = [[0.2, 0.8], [0.7, 0.3]]
+        Kokako.parameterize(subproblem, [:A, :B], beliefs[node]) do ω
+            return nothing
+        end
+    end
+    belief_updater = Kokako.construct_belief_update(model, [Set([1]), Set([2])])
+    belief = Dict(1 => 1.0, 2 => 0.0)
+    @test belief_updater(belief, 2, :A) == Dict(1 => 0.0, 2 => 1.0)
+    belief = Dict(1 => 0.0, 2 => 1.0)
+    @test belief_updater(belief, 1, :B) == Dict(1 => 1.0, 2 => 0.0)
+
+
+    belief_updater = Kokako.construct_belief_update(model, [Set([1, 2])])
+
+    belief = Dict(1 => 1.0, 2 => 0.0)
+    @test belief_updater(belief, 1, :A) == Dict(1 => 0.0, 2 => 1.0)
+    belief = Dict(1 => 0.0, 2 => 1.0)
+    @test belief_updater(belief, 1, :B) == Dict(1 => 1.0, 2 => 0.0)
+
+    function is_approx(x::Dict{T, Float64}, y::Dict{T, Float64}) where T
+        if length(x) != length(y)
+            return false
+        end
+        for (key, value) in x
+            if !(value ≈ y[key])
+                return false
+            end
+        end
+        return true
+    end
+    belief = Dict(1 => 0.6, 2 => 0.4)
+    @test is_approx(
+        belief_updater(belief, 1, :A),
+        Dict(1 => 6 / 41, 2 => 35 / 41)
+    )
 end

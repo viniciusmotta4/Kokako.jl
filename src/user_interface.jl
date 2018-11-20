@@ -9,27 +9,46 @@ struct Graph{T}
     # nodes[x] returns a vector of the children of node x and their
     # probabilities.
     nodes::Dict{T, Vector{Tuple{T, Float64}}}
-end
+    # A partition of the nodes into ambiguity sets.
+    belief_partition::Vector{Vector{T}}
 
-function validate_graph(graph)
-    for (node, children) in nodes
-        probability = sum(child[2] for child in children)
-        if !(0.0 <= probability <= 1.0)
-            error("Probability on edges leaving node $(node) sum to " *
-                  "$(probability), but this must be in [0.0, 1.0]")
-        end
+    function Graph(root_node::T) where T
+        return new{T}(
+            root_node,
+            Dict{T, Vector{Tuple{T, Float64}}}(
+                root_node => Tuple{T, Float64}[]
+            ),
+            Vector{T}[]
+        )
     end
 end
 
-function Graph(root_node::T) where T
-    return Graph(root_node, Dict{T, Vector{Tuple{T, Float64}}}(
-        root_node => Tuple{T, Float64}[]))
+function validate_graph(graph)
+    for (node, children) in graph.nodes
+        if length(children) > 0
+            probability = sum(child[2] for child in children)
+            if !(0.0 <= probability <= 1.0)
+                error("Probability on edges leaving node $(node) sum to " *
+                      "$(probability), but this must be in [0.0, 1.0]")
+            end
+        end
+    end
+    if length(graph.belief_partition) > 0
+        if length(graph.nodes) != union(graph.belief_partition...)
+            error("Belief partition $(graph.belief_partition) does not form a" *
+                  " valid partition of the nodes in the graph.")
+        end
+    end
 end
 
 """
     add_node(graph::Graph{T}, node::T) where T
 
 Add a node to the graph `graph`.
+
+### Examples
+
+    add_node(graph, :A)
 """
 function add_node(graph::Graph{T}, node::T) where T
     if haskey(graph.nodes, node) || node == graph.root_node
@@ -43,9 +62,14 @@ function add_node(graph::Graph{T}, node) where T
 end
 
 """
-    add_node(graph::Graph{T}, node::T) where T
+    add_edge(graph::Graph{T}, edge::Pair{T, T}, probability::Float64) where T
 
 Add an edge to the graph `graph`.
+
+### Examples
+
+    add_edge(graph, 1 => 2, 0.9)
+    add_edge(graph, :root => :A, 1.0)
 """
 function add_edge(graph::Graph{T}, edge::Pair{T, T},
                   probability::Float64) where T
@@ -62,13 +86,31 @@ function add_edge(graph::Graph{T}, edge::Pair{T, T},
     return
 end
 
+"""
+    add_partition(graph::Graph{T}, set::Vector{T})
+
+Add `set` to the belief partition of `graph`.
+
+### Examples
+
+    graph = LinearGraph(3)
+    add_partition(graph, [1, 2])
+    add_partition(graph, [3])
+"""
+function add_partition(graph::Graph{T}, set::Vector{T}) where T
+    push!(graph.belief_partition, set)
+    return
+end
+
 function Graph(root_node::T, nodes::Vector{T},
-               edges::Vector{Tuple{Pair{T, T}, Float64}}) where T
+               edges::Vector{Tuple{Pair{T, T}, Float64}};
+               belief_partition::Vector{Vector{T}} = Vector{T}[]) where T
     graph = Graph(root_node)
     add_node.(Ref(graph), nodes)
     for (edge, probability) in edges
         add_edge(graph, edge, probability)
     end
+    add_partition.(Ref(graph), belief_partition)
     return graph
 end
 
@@ -186,6 +228,9 @@ struct PolicyGraph{T}
     initial_root_state::Dict{Symbol, Float64}
     # All nodes in the graph.
     nodes::Dict{T, Node{T}}
+    # Belief partition.
+    belief_partition::Vector{Set{T}}
+
     function PolicyGraph(T, sense::Symbol)
         optimization_sense = if sense == :Min
             MOI.MinSense
@@ -194,7 +239,8 @@ struct PolicyGraph{T}
         else
             error("The optimization sense must be :Min or :Max. It is $(sense).")
         end
-        new{T}(optimization_sense, Noise{T}[], Dict{Symbol, Float64}(), Dict{T, Node{T}}())
+        return new{T}(optimization_sense, Noise{T}[], Dict{Symbol, Float64}(),
+            Dict{T, Node{T}}(), Set{T}[])
     end
 end
 
@@ -227,6 +273,13 @@ function construct_subproblem(optimizer_factory::Nothing, direct_mode::Bool)
               "direct_mode=true.")
     end
     return JuMP.Model()
+end
+
+struct BeliefState{T}
+    belief::Dict{T, Float64}
+    belief′::Dict{T, Float64}
+    μ::Dict{T, JuMP.VariableRef}
+    updater::Function
 end
 
 """
@@ -262,6 +315,7 @@ function PolicyGraph(builder::Function, graph::Graph{T};
                      bellman_function = AverageCut(),
                      optimizer = nothing,
                      direct_mode = true) where T
+    validate_graph(graph)
     policy_graph = PolicyGraph(T, sense)
     # Initialize nodes.
     for (node_index, children) in graph.nodes
@@ -309,10 +363,35 @@ function PolicyGraph(builder::Function, graph::Graph{T};
     for (child, probability) in graph.nodes[graph.root_node]
         push!(policy_graph.root_children, Noise(child, probability))
     end
+    # Form the belief partition.
+    belief_updater = compute_belief_update(
+        policy_graph, Set.(graph.belief_partition))
+    belief = Dict{T, Float64}()
+    for node_index in graph.nodes
+        belief[node_index] = 1 / length(graph.nodes)
+    end
+    for partition in graph.belief_partition
+        push!(policy_graph.belief_partition, Set(partition))
+        for node_index in partition
+            node = policy_graph[node_index]
+            # TODO: lipschitz bounds?
+            μ = @variable(node.subproblem, [n in partition],
+                lower_bound = -1e6,
+                upper_bound = 1e6,
+                container = Dict
+            )
+            node.subproblem.ext[:kokako_belief] = BeliefState{T}(
+                copy(belief),
+                copy(belief)
+                μ,
+                belief_updater
+            )
+        end
+    end
     return policy_graph
 end
 
-# Internal functino: helper to get the node given a subproblem.
+# Internal function: helper to get the node given a subproblem.
 function get_node(subproblem::JuMP.Model)
     return subproblem.ext[:kokako_node]::Node
 end
@@ -475,4 +554,65 @@ JuMP.variable_type(model::JuMP.Model, ::Type{State}) = State
 
 function JuMP.value(state::State{JuMP.VariableRef})
     return State(JuMP.value(state.in), JuMP.value(state.out))
+end
+
+"""
+    compute_belief_update(graph::PolicyGraph{T}, partition::Vector{Set{T}})
+
+Returns a function that calculates the belief update.
+    construct_belief_update(
+        incoming_belief::Dict{T, Float64},
+        observed_partition::Int,
+        observed_noise
+    )::Dict{T, Float64}
+
+We use Bayes theorem: P(X′ | Y) = P(Y | X′) × P(X′) / P(Y), where P(Xᵢ′ | Y) is
+the probability of being in node i given the observation of ω.
+P(Xⱼ′) = ∑ᵢ P(Xᵢ) × Φᵢⱼ
+P(Y|Xᵢ′) = P(ω ∈ Ωᵢ)
+P(Y) = ∑ᵢ P(Xᵢ′) × P(ω ∈ Ωᵢ)
+"""
+function construct_belief_update(
+    graph::Kokako.PolicyGraph{T}, partition::Vector{Set{T}}) where T
+    # TODO: check that partition is proper.
+    # TODO: throw errors for invalid belief? Or do we just assume that we can
+    #     never be given an invalid belief.
+    Φ = Kokako.build_Φ(graph)  # Dict{Tuple{T, T}, Float64}
+    Ω = Dict{T, Dict{Any, Float64}}()
+    for (index, node) in graph.nodes
+        Ω[index] = Dict{Any, Float64}()
+        for noise in node.noise_terms
+            Ω[index][noise.term] = noise.probability
+        end
+    end
+    function belief_updater(
+        incoming_belief::Dict{T, Float64},
+        observed_partition::Int,
+        observed_noise)::Dict{T, Float64}
+        # Intialize outgoing storage.
+        outgoing_belief = copy(incoming_belief)
+        # P(Y) = ∑ᵢ Xᵢ × ∑ⱼ P(i->j) × P(ω ∈ Ωⱼ)
+        PY = 0.0
+        for (node_i, belief) in incoming_belief
+            probability = 0.0
+            for (node_j, Ωj) in Ω
+                p_ij = get(Φ, (node_i, node_j), 0.0)
+                p_ω = get(Ωj, observed_noise, 0.0)
+                probability += p_ij * p_ω
+            end
+            PY += belief * probability
+        end
+        # Now update each belief.
+        for (node_i, belief) in incoming_belief
+            PX = sum(belief * get(Φ, (node_j, node_i), 0.0)
+                for (node_j, belief) in incoming_belief)
+            PY_X = 0.0
+            if node_i in partition[observed_partition]
+                PY_X += get(Ω[node_i], observed_noise, 0.0)
+            end
+            outgoing_belief[node_i] = PY_X * PX / PY
+        end
+        return outgoing_belief
+    end
+    return belief_updater
 end
