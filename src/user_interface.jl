@@ -275,6 +275,8 @@ function construct_subproblem(optimizer_factory::Nothing, direct_mode::Bool)
     return JuMP.Model()
 end
 
+# Storage for belief-related things.
+# TODO(odow): incorporate this into `::Node`?
 struct BeliefState{T}
     belief::Dict{T, Float64}
     belief′::Dict{T, Float64}
@@ -314,8 +316,11 @@ function PolicyGraph(builder::Function, graph::Graph{T};
                      sense = :Min,
                      bellman_function = AverageCut(),
                      optimizer = nothing,
-                     direct_mode = true) where T
+                     direct_mode = true) where {T}
+    # Spend a one-off cost validating the graph.
     validate_graph(graph)
+    # Construct a basic policy graph. We will add to it in the remainder of this
+    # function.
     policy_graph = PolicyGraph(T, sense)
     # Initialize nodes.
     for (node_index, children) in graph.nodes
@@ -363,26 +368,42 @@ function PolicyGraph(builder::Function, graph::Graph{T};
     for (child, probability) in graph.nodes[graph.root_node]
         push!(policy_graph.root_children, Noise(child, probability))
     end
-    # Form the belief partition.
+
+    # Pre-compute the function `belief_updater`. See `compute_belief_update` for
+    # details.
     belief_updater = compute_belief_update(
         policy_graph, Set.(graph.belief_partition))
+    # Initialize a belief dictionary (containing one element for each node in
+    # the graph). Initial belief probabilities are 1/N. We're going to make
+    # copies of this below.
+    # TODO(odow): set initial belief probability.
     belief = Dict{T, Float64}()
     for node_index in graph.nodes
         belief[node_index] = 1 / length(graph.nodes)
     end
+    # Now for each element in the partition...
     for partition in graph.belief_partition
+        # Store the partition in the `policy_graph` object.
         push!(policy_graph.belief_partition, Set(partition))
+        # Then for each node in the partition.
         for node_index in partition
+            # Get the `::Node` object.
             node = policy_graph[node_index]
-            # TODO: lipschitz bounds?
+            # Add the dual variable μ for the cut:
+            # θ ≥ α + <β, x> - <b, μ>
+            # We need one variable for each non-zero belief state.
+            # TODO: lipschitz bounds: `|μ|∞ ≤ L`? Ideally we want these to be
+            # node-dependent.
             μ = @variable(node.subproblem, [n in partition],
                 lower_bound = -1e6,
                 upper_bound = 1e6,
                 container = Dict
             )
+            # Attach the belief state as an extension.
+            # TODO(odow): make the belief state part of the `::Node` object.
             node.subproblem.ext[:kokako_belief] = BeliefState{T}(
                 copy(belief),
-                copy(belief)
+                copy(belief),
                 μ,
                 belief_updater
             )
