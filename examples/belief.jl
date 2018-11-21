@@ -1,6 +1,6 @@
-using Kokako, Test
+using Kokako, GLPK, Test
 
-function infinite_trivial()
+function infinite_belief()
     graph = Kokako.Graph(
         :root_node,
         [:A, :B],
@@ -12,7 +12,7 @@ function infinite_trivial()
     )
 
     model = Kokako.PolicyGraph(graph,
-                bellman_function = AverageCut(lower_bound = 0.0),
+                bellman_function = Kokako.AverageCut(lower_bound = 0.0),
                 optimizer = with_optimizer(GLPK.Optimizer)
                     ) do subproblem, node
         @variables(subproblem, begin
@@ -37,4 +37,4 @@ function infinite_trivial()
 end
 
 model = infinite_belief()
-Kokako.train(model; iteration_limit = 10)
+# Kokako.train(model; iteration_limit = 10, print_level = 2)

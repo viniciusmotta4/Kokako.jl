@@ -157,6 +157,14 @@ function refine_bellman_function(graph::PolicyGraph{T},
         intercept -= coefficients[name] * value
     end
 
+    belief_component = JuMP.AffExpr(0.0)
+    if haskey(node.subproblem.ext, :kokako_belief)
+        belief = node.subproblem.ext[:kokako_belief]::BeliefState{T}
+        for (key, value) in belief.μ
+            belief_component += belief.belief[key] * value
+        end
+    end
+
     # Test whether we should add the new cut to the subproblem. We do this now
     # before collating the intercept to avoid twice the work.
     cut_is_an_improvement = if bellman_function.cut_improvement_tolerance > 0.0
@@ -168,13 +176,15 @@ function refine_bellman_function(graph::PolicyGraph{T},
 
     if cut_is_an_improvement
         index = if is_minimization
-            @constraint(node.subproblem, bellman_function.variable >=
-                intercept + sum(coefficients[name] * state.out
-                    for (name, state) in node.states))
+            @constraint(node.subproblem,
+                bellman_function.variable + belief_component >=
+                    intercept + sum(coefficients[name] * state.out
+                        for (name, state) in node.states))
         else
-            @constraint(node.subproblem, bellman_function.variable <=
-                intercept + sum(coefficients[name] * state.out
-                    for (name, state) in node.states))
+            @constraint(node.subproblem,
+                bellman_function.variable + belief_component <=
+                    intercept + sum(coefficients[name] * state.out
+                        for (name, state) in node.states))
         end
     end
     return

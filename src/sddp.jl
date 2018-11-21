@@ -11,7 +11,7 @@ const SDDP_TIMER = TimerOutputs.TimerOutput()
 # risk_measure = (node_index) -> node_index == 1 ? Expectation() : WorstCase()
 # It will return a dictionary with a key for each node_index in the policy
 # graph, and a corresponding value of whatever the user provided.
-function to_nodal_form(graph::PolicyGraph{T}, element) where T
+function to_nodal_form(graph::PolicyGraph{T}, element) where {T}
     # Note: we don't copy element here, so it element is mutable, you should use
     # to_nodal_form(graph, x -> new_element()) instead. A good example is
     # Vector{T}; use to_nodal_form(graph, i -> T[]).
@@ -21,7 +21,7 @@ function to_nodal_form(graph::PolicyGraph{T}, element) where T
     end
     return store
 end
-function to_nodal_form(graph::PolicyGraph{T}, builder::Function) where T
+function to_nodal_form(graph::PolicyGraph{T}, builder::Function) where {T}
     node = first(keys(graph.nodes))
     element = builder(node)
     store = Dict{T, typeof(element)}()
@@ -46,7 +46,7 @@ end
 #
 # TODO(odow): this is inefficient as it is O(n²) in the number of nodes, but
 # it's just a one-off hit so let's optimize later.
-function get_same_children(graph::PolicyGraph{T}) where T
+function get_same_children(graph::PolicyGraph{T}) where {T}
     same_children = Dict{T, Vector{T}}()
     # For each node in the graph
     for (node_index_1, node_1) in graph.nodes
@@ -69,7 +69,7 @@ function get_same_children(graph::PolicyGraph{T}) where T
     return same_children
 end
 
-function build_Φ(graph::PolicyGraph{T}) where T
+function build_Φ(graph::PolicyGraph{T}) where {T}
     Φ = Dict{Tuple{T, T}, Float64}()
     for (node_index_1, node_1) in graph.nodes
         for child in node_1.children
@@ -174,13 +174,24 @@ end
 
 # Internal function: set the objective of node to the stage objective, plus the
 # cost/value-to-go term.
-function set_objective(graph::PolicyGraph{T}, node::Node{T}) where T
+function set_objective(graph::PolicyGraph{T}, node::Node{T}) where {T}
+    belief_obj = JuMP.AffExpr(0.0)
+    if haskey(node.subproblem.ext, :kokako_belief)
+        belief = node.subproblem.ext[:kokako_belief]::BeliefState{T}
+        for (key, variable) in belief.μ
+            belief_obj -= belief.belief[key] * variable
+        end
+        node.stage_objective_set = false
+    end
+    if !node.stage_objective_set
+        JuMP.set_objective(
+            node.subproblem,
+            graph.objective_sense,
+            node.stage_objective + belief_obj + bellman_term(node.bellman_function)
+        )
+    end
     node.stage_objective_set = true
-    JuMP.set_objective(
-        node.subproblem,
-        graph.objective_sense,
-        node.stage_objective + bellman_term(node.bellman_function)
-    )
+    return
 end
 
 # Internal function: overload for the case where JuMP.value fails on a
@@ -196,17 +207,13 @@ function solve_subproblem(graph::PolicyGraph{T},
                           node::Node{T},
                           state::Dict{Symbol, Float64},
                           noise,
-                          require_duals::Bool = true) where T
+                          require_duals::Bool = true) where {T}
     # Parameterize the model. First, fix the value of the incoming state
     # variables. Then parameterize the model depending on `noise`. Finally,
-    # set the objective. Note that we set the objective every time incase
-    # the user calls set_stage_objective in the parameterize function.
+    # set the objective.
     set_incoming_state(node, state)
     node.parameterize(noise)
-    # Only call it if the stage-objective changes.
-    if !node.stage_objective_set
-        set_objective(graph, node)
-    end
+    set_objective(graph, node)
     JuMP.optimize!(node.subproblem)
     # Test for primal feasibility.
     primal_status = JuMP.primal_status(node.subproblem)
@@ -237,9 +244,18 @@ function solve_subproblem(graph::PolicyGraph{T},
            JuMP.objective_value(node.subproblem)  # C(x, u, ω) + θ
 end
 
+# Internal function: calculate the initial belief state.
+function initialize_belief(graph::PolicyGraph{T}) where {T}
+    current_belief = Dict{T, Float64}(keys(graph.nodes) .=> 0.0)
+    for child in graph.root_children
+        current_belief[child.term] = child.probability
+    end
+    return current_belief
+end
+
 # Internal function: perform a single forward pass of the SDDP algorithm given
 # options.
-function forward_pass(graph::PolicyGraph{T}, options::Options) where T
+function forward_pass(graph::PolicyGraph{T}, options::Options) where {T}
     # First up, sample a scenario. Note that if a cycle is detected, this will
     # return the cycle node as well.
     TimerOutputs.@timeit SDDP_TIMER "sample_scenario" begin
@@ -250,6 +266,9 @@ function forward_pass(graph::PolicyGraph{T}, options::Options) where T
     end
     # Storage for the list of outgoing states that we visit on the forward pass.
     sampled_states = Dict{Symbol, Float64}[]
+    # Storage for the belief states: partition index and the belief dictionary.
+    belief_states = Tuple{Int, Dict{T, Float64}}[]
+    current_belief = initialize_belief(graph)
     # Our initial incoming state.
     incoming_state_value = copy(options.initial_state)
     # A cumulator for the stage-objectives.
@@ -257,6 +276,14 @@ function forward_pass(graph::PolicyGraph{T}, options::Options) where T
     # Iterate down the scenario.
     for (node_index, noise) in scenario_path
         node = graph[node_index]
+        # Update belief state, etc.
+        if haskey(node.subproblem.ext, :kokako_belief)
+            belief = node.subproblem.ext[:kokako_belief]::BeliefState{T}
+            partition_index = belief.partition_index
+            current_belief = belief.updater(
+                belief.belief, current_belief, partition_index, noise)
+            push!(belief_states, (partition_index, copy(current_belief)))
+        end
         # ===== Begin: starting state for infinite horizon =====
         starting_states = options.starting_states[node_index]
         if length(starting_states) > 0
@@ -311,7 +338,7 @@ function forward_pass(graph::PolicyGraph{T}, options::Options) where T
         end
     end
     # ===== End: drop off starting state if terminated due to cycle =====
-    return scenario_path, sampled_states, cumulative_value
+    return scenario_path, sampled_states, belief_states, cumulative_value
 end
 
 # Internal function: calculate the minimum distance between the state `state`
@@ -339,13 +366,26 @@ function inf_norm(x::Dict{Symbol, Float64}, y::Dict{Symbol, Float64})
 end
 
 # Internal function: perform a backward pass of the SDDP algorithm along the
-# scenario_path, refining the bellman function at sampled_states. Assumes that
-# scenario_path does not end in a leaf node (i.e., the forward pass was solved
-# with include_last_node = false)
+# scenario_path, refining the bellman function at sampled_states.
 function backward_pass(graph::PolicyGraph{T},
                        options::Options,
                        scenario_path::Vector{Tuple{T, NoiseType}},
-                       sampled_states::Vector{Dict{Symbol, Float64}}
+                       sampled_states::Vector{Dict{Symbol, Float64}},
+                       belief_states::Vector{Tuple{Int, Dict{T, Float64}}}
+                           ) where {T, NoiseType}
+    if length(belief_states) > 0
+        backward_pass_with_belief(
+            graph, options, scenario_path, sampled_states, belief_states)
+    else
+        backward_pass_no_belief(graph, options, scenario_path, sampled_states)
+    end
+end
+
+function backward_pass_no_belief(
+        graph::PolicyGraph{T},
+        options::Options,
+        scenario_path::Vector{Tuple{T, NoiseType}},
+        sampled_states::Vector{Dict{Symbol, Float64}}
                            ) where {T, NoiseType}
     for index in length(scenario_path):-1:1
         # Lookup node, noise realization, and outgoing state variables.
@@ -427,6 +467,99 @@ function backward_pass(graph::PolicyGraph{T},
     end
 end
 
+function backward_pass_with_belief(
+        graph::PolicyGraph{T},
+        options::Options,
+        scenario_path::Vector{Tuple{T, NoiseType}},
+        sampled_states::Vector{Dict{Symbol, Float64}},
+        belief_states::Vector{Tuple{Int, Dict{T, Float64}}}
+            ) where {T, NoiseType}
+    for index in length(scenario_path):-1:1
+        outgoing_state = sampled_states[index]
+        # We cache the (parent, child, noise) indices for the following vectors
+        # so that if we ever have to re-solve, we can look up the solution
+        # instead of solving another LP.
+        solution_indices = Dict{Tuple{T, Any}, Int}()
+        dual_variables = Dict{Symbol, Float64}[]
+        noise_supports = Noise[]
+        child_indices = T[]
+        original_probability = Float64[]
+        objective_realizations = Float64[]
+        belief_probability = Float64[]
+        #
+        partition_index, belief_state = belief_states[index]
+        for (node_index, belief) in belief_state
+            if belief > 0.0
+                node = graph[node_index]
+                if length(node.children) == 0
+                    continue
+                end
+                # Solve all children.
+                for child in node.children
+                    child_node = graph[child.term]
+                    for noise in child_node.noise_terms
+                        # Update belief state, etc.
+                        if haskey(child_node.subproblem.ext, :kokako_belief)
+                            kokako_belief = child_node.subproblem.ext[:kokako_belief]::BeliefState{T}
+                            new_partition_index = kokako_belief.partition_index
+                            kokako_belief.updater(
+                                kokako_belief.belief, belief_state, new_partition_index, noise)
+                        end
+                        if haskey(solution_indices, (child.term, noise.term))
+                            sol_index = solution_indices[(child.term, noise.term)]
+                            push!(dual_variables, dual_variables[sol_index])
+                            push!(noise_supports, noise_supports[sol_index])
+                            push!(child_indices, child_node.index)
+                            push!(original_probability, original_probability[sol_index])
+                            push!(belief_probability, belief)
+                            push!(objective_realizations, objective_realizations[sol_index])
+                        else
+                            TimerOutputs.@timeit SDDP_TIMER "solve_subproblem" begin
+                                (new_outgoing_state, duals, stage_objective, obj) =
+                                    solve_subproblem(
+                                        graph, child_node, outgoing_state, noise.term
+                                    )
+                            end
+                            push!(dual_variables, duals)
+                            push!(noise_supports, noise)
+                            push!(child_indices, child_node.index)
+                            push!(original_probability,
+                                child.probability * noise.probability
+                            )
+                            push!(belief_probability, belief)
+                            push!(objective_realizations, obj)
+                            solution_indices[(child.term, noise.term)] =
+                                length(dual_variables)
+                        end
+                    end
+                end
+            end
+        end
+        # We need to refine our estimate at all nodes in the partition.
+        for node_index in partition
+            node = graph[node_index]
+            # Update belief state, etc.
+            if haskey(child_node.subproblem.ext, :kokako_belief)
+                kokako_belief = child_node.subproblem.ext[:kokako_belief]::BeliefState{T}
+                for (idx, belief) in belief_state
+                    kokako_belief.belief[idx] = belief
+                end
+            end
+            refine_bellman_function(
+                graph,
+                node,
+                node.bellman_function,
+                options.risk_measures[node_index],
+                outgoing_state,
+                dual_variables,
+                noise_supports,
+                original_probability .* belief_probability,
+                objective_realizations
+            )
+        end
+    end
+end
+
 """
     Kokako.calculate_bound(graph::PolicyGraph, state::Dict{Symbol, Float64},
                            risk_measure=Expectation())
@@ -443,10 +576,19 @@ function calculate_bound(graph::PolicyGraph,
     noise_supports = Any[]
     probabilities = Float64[]
     objectives = Float64[]
+    belief = initialize_belief(graph)
+
     # Solve all problems that are children of the root node.
     for child in graph.root_children
         node = graph[child.term]
         for noise in node.noise_terms
+            # Update belief state, etc.
+            if haskey(node.subproblem.ext, :kokako_belief)
+                belief = node.subproblem.ext[:kokako_belief]::BeliefState{T}
+                partition_index = belief.partition_index
+                belief.updater(
+                    belief.belief, current_belief, partition_index, noise)
+            end
             (outgoing_state, duals, stage_objective, obj) =
                 solve_subproblem(graph, node, root_state, noise.term)
             push!(objectives, obj)
@@ -533,14 +675,13 @@ function train(graph::PolicyGraph;
         has_converged = false
         while !has_converged
             TimerOutputs.@timeit SDDP_TIMER "forward_pass" begin
-                scenario_path, sampled_states, cumulative_value = forward_pass(
-                    graph, options)
+                scenario_path, sampled_states, belief_states, cumulative_value =
+                    forward_pass(graph, options)
             end
             TimerOutputs.@timeit SDDP_TIMER "backward_pass" begin
-                backward_pass(graph,
-                              options,
-                              scenario_path,
-                              sampled_states)
+                backward_pass(
+                    graph, options, scenario_path, sampled_states, belief_states
+                )
             end
             TimerOutputs.@timeit SDDP_TIMER "calculate_bound" begin
                 bound = calculate_bound(graph)
@@ -572,11 +713,11 @@ end
 
 # Internal function: helper to conduct a single simulation. Users should use the
 # documented, user-facing function Kokako.simulate instead.
-function _simulate(graph::PolicyGraph,
+function _simulate(graph::PolicyGraph{T},
                    variables::Vector{Symbol} = Symbol[];
                    sampling_scheme::AbstractSamplingScheme =
                        InSampleMonteCarlo(),
-                   custom_recorders = Dict{Symbol, Function}())
+                   custom_recorders = Dict{Symbol, Function}()) where {T}
     # Sample a scenario path.
     scenario_path, terminated_due_to_cycle = sample_scenario(
         graph, sampling_scheme
@@ -585,10 +726,19 @@ function _simulate(graph::PolicyGraph,
     simulation = Dict{Symbol, Any}[]
     # The incoming state values.
     incoming_state = copy(graph.initial_root_state)
+    current_belief = initialize_belief(graph)
     # A cumulator for the stage-objectives.
     cumulative_value = 0.0
     for (node_index, noise) in scenario_path
         node = graph[node_index]
+        if haskey(node.subproblem.ext, :kokako_belief)
+            belief = node.subproblem.ext[:kokako_belief]::BeliefState{T}
+            partition_index = belief.partition_index
+            current_belief = belief.updater(
+                belief.belief, current_belief, partition_index, noise)
+        else
+            current_belief = Dict(node_index => 1.0)
+        end
         # Solve the subproblem.
         outgoing_state, duals, stage_objective, objective = solve_subproblem(
             graph, node, incoming_state, noise)
@@ -599,7 +749,8 @@ function _simulate(graph::PolicyGraph,
             :node_index => node_index,
             :noise_term => noise,
             :stage_objective => stage_objective,
-            :bellman_term => objective - stage_objective
+            :bellman_term => objective - stage_objective,
+            :belief => copy(current_belief)
         )
         # Loop through the primal variable values that the user wants.
         for variable in variables

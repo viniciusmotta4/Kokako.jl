@@ -34,7 +34,13 @@ function validate_graph(graph)
         end
     end
     if length(graph.belief_partition) > 0
-        if length(graph.nodes) != union(graph.belief_partition...)
+        # The -1 accounts for the root node, which shouldn't be in the
+        # partition.
+        if graph.root_node in union(graph.belief_partition...)
+            error("Belief partition $(graph.belief_partition) cannot contain " *
+                  "the root node $(graph.root_node).")
+        end
+        if length(graph.nodes) - 1 != length(union(graph.belief_partition...))
             error("Belief partition $(graph.belief_partition) does not form a" *
                   " valid partition of the nodes in the graph.")
         end
@@ -278,8 +284,8 @@ end
 # Storage for belief-related things.
 # TODO(odow): incorporate this into `::Node`?
 struct BeliefState{T}
+    partition_index::Int
     belief::Dict{T, Float64}
-    belief′::Dict{T, Float64}
     μ::Dict{T, JuMP.VariableRef}
     updater::Function
 end
@@ -369,20 +375,16 @@ function PolicyGraph(builder::Function, graph::Graph{T};
         push!(policy_graph.root_children, Noise(child, probability))
     end
 
-    # Pre-compute the function `belief_updater`. See `compute_belief_update` for
-    # details.
-    belief_updater = compute_belief_update(
+    # Pre-compute the function `belief_updater`. See `construct_belief_update`
+    # for details.
+    belief_updater = construct_belief_update(
         policy_graph, Set.(graph.belief_partition))
     # Initialize a belief dictionary (containing one element for each node in
-    # the graph). Initial belief probabilities are 1/N. We're going to make
-    # copies of this below.
-    # TODO(odow): set initial belief probability.
-    belief = Dict{T, Float64}()
-    for node_index in graph.nodes
-        belief[node_index] = 1 / length(graph.nodes)
-    end
+    # the graph).
+    belief = Dict{T, Float64}(keys(graph.nodes) .=> 0.0)
+    delete!(belief, graph.root_node)
     # Now for each element in the partition...
-    for partition in graph.belief_partition
+    for (partition_index, partition) in enumerate(graph.belief_partition)
         # Store the partition in the `policy_graph` object.
         push!(policy_graph.belief_partition, Set(partition))
         # Then for each node in the partition.
@@ -402,7 +404,7 @@ function PolicyGraph(builder::Function, graph::Graph{T};
             # Attach the belief state as an extension.
             # TODO(odow): make the belief state part of the `::Node` object.
             node.subproblem.ext[:kokako_belief] = BeliefState{T}(
-                copy(belief),
+                partition_index,
                 copy(belief),
                 μ,
                 belief_updater
@@ -578,7 +580,7 @@ function JuMP.value(state::State{JuMP.VariableRef})
 end
 
 """
-    compute_belief_update(graph::PolicyGraph{T}, partition::Vector{Set{T}})
+    construct_belief_update(graph::PolicyGraph{T}, partition::Vector{Set{T}})
 
 Returns a function that calculates the belief update.
     construct_belief_update(
@@ -607,11 +609,10 @@ function construct_belief_update(
         end
     end
     function belief_updater(
+        outgoing_belief::Dict{T, Float64},
         incoming_belief::Dict{T, Float64},
         observed_partition::Int,
         observed_noise)::Dict{T, Float64}
-        # Intialize outgoing storage.
-        outgoing_belief = copy(incoming_belief)
         # P(Y) = ∑ᵢ Xᵢ × ∑ⱼ P(i->j) × P(ω ∈ Ωⱼ)
         PY = 0.0
         for (node_i, belief) in incoming_belief
