@@ -397,8 +397,8 @@ function PolicyGraph(builder::Function, graph::Graph{T};
             # TODO: lipschitz bounds: `|μ|∞ ≤ L`? Ideally we want these to be
             # node-dependent.
             μ = @variable(node.subproblem, [n in partition],
-                lower_bound = -1e2,
-                upper_bound = 1e2,
+                lower_bound = -1e3,
+                upper_bound = 1e3,
                 container = Dict
             )
             add_initial_bounds(node, μ)
