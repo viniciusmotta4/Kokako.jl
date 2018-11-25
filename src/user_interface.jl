@@ -392,15 +392,16 @@ function PolicyGraph(builder::Function, graph::Graph{T};
             # Get the `::Node` object.
             node = policy_graph[node_index]
             # Add the dual variable μ for the cut:
-            # θ ≥ α + <β, x> - <b, μ>
+            # <b, μ> + θ ≥ α + <β, x>
             # We need one variable for each non-zero belief state.
             # TODO: lipschitz bounds: `|μ|∞ ≤ L`? Ideally we want these to be
             # node-dependent.
             μ = @variable(node.subproblem, [n in partition],
-                lower_bound = -1e6,
-                upper_bound = 1e6,
+                lower_bound = -1e2,
+                upper_bound = 1e2,
                 container = Dict
             )
+            add_initial_bounds(node, μ)
             # Attach the belief state as an extension.
             # TODO(odow): make the belief state part of the `::Node` object.
             node.subproblem.ext[:kokako_belief] = BeliefState{T}(
@@ -412,6 +413,24 @@ function PolicyGraph(builder::Function, graph::Graph{T};
         end
     end
     return policy_graph
+end
+
+# Internal function: When created, θ has bounds of [-M, M], but, since we are
+# adding these μ terms, we really want to bound <b, μ> + θ ∈ [-M, M]. Keeping in
+# mind that ∑b = 1, we really only need to add these constraints at the corners
+# of the box where one element in b is 1, and all the rest are 0.
+function add_initial_bounds(node, μ::Dict)
+    θ = bellman_term(node.bellman_function)
+    lower_bound = JuMP.lower_bound(θ)
+    upper_bound = JuMP.upper_bound(θ)
+    for (key, variable) in μ
+        if lower_bound > -Inf
+            @constraint(node.subproblem, variable + θ >= lower_bound)
+        end
+        if upper_bound < Inf
+            @constraint(node.subproblem, variable + θ <= upper_bound)
+        end
+    end
 end
 
 # Internal function: helper to get the node given a subproblem.

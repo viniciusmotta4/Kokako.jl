@@ -37,4 +37,4 @@ function infinite_belief()
 end
 
 model = infinite_belief()
-# Kokako.train(model; iteration_limit = 10, print_level = 2)
+Kokako.train(model; iteration_limit = 40, print_level = 2)

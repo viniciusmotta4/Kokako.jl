@@ -179,7 +179,7 @@ function set_objective(graph::PolicyGraph{T}, node::Node{T}) where {T}
     if haskey(node.subproblem.ext, :kokako_belief)
         belief = node.subproblem.ext[:kokako_belief]::BeliefState{T}
         for (key, variable) in belief.μ
-            belief_obj -= belief.belief[key] * variable
+            belief_obj += belief.belief[key] * variable
         end
         node.stage_objective_set = false
     end
@@ -498,13 +498,6 @@ function backward_pass_with_belief(
                 for child in node.children
                     child_node = graph[child.term]
                     for noise in child_node.noise_terms
-                        # Update belief state, etc.
-                        if haskey(child_node.subproblem.ext, :kokako_belief)
-                            kokako_belief = child_node.subproblem.ext[:kokako_belief]::BeliefState{T}
-                            new_partition_index = kokako_belief.partition_index
-                            kokako_belief.updater(
-                                kokako_belief.belief, belief_state, new_partition_index, noise)
-                        end
                         if haskey(solution_indices, (child.term, noise.term))
                             sol_index = solution_indices[(child.term, noise.term)]
                             push!(dual_variables, dual_variables[sol_index])
@@ -514,6 +507,16 @@ function backward_pass_with_belief(
                             push!(belief_probability, belief)
                             push!(objective_realizations, objective_realizations[sol_index])
                         else
+                            # Update belief state, etc.
+                            if haskey(child_node.subproblem.ext, :kokako_belief)
+                                kokako_belief = child_node.subproblem.ext[:kokako_belief]::BeliefState{T}
+                                new_partition_index = kokako_belief.partition_index
+                                kokako_belief.updater(
+                                    kokako_belief.belief,
+                                    belief_state,
+                                    new_partition_index,
+                                    noise.term)
+                            end
                             TimerOutputs.@timeit SDDP_TIMER "solve_subproblem" begin
                                 (new_outgoing_state, duals, stage_objective, obj) =
                                     solve_subproblem(
@@ -536,11 +539,11 @@ function backward_pass_with_belief(
             end
         end
         # We need to refine our estimate at all nodes in the partition.
-        for node_index in partition
+        for node_index in graph.belief_partition[partition_index]
             node = graph[node_index]
             # Update belief state, etc.
-            if haskey(child_node.subproblem.ext, :kokako_belief)
-                kokako_belief = child_node.subproblem.ext[:kokako_belief]::BeliefState{T}
+            if haskey(node.subproblem.ext, :kokako_belief)
+                kokako_belief = node.subproblem.ext[:kokako_belief]::BeliefState{T}
                 for (idx, belief) in belief_state
                     kokako_belief.belief[idx] = belief
                 end
@@ -568,15 +571,16 @@ Calculate the lower bound (if minimizing, otherwise upper bound) of the problem
 graph at the point state, assuming the risk measure at the root node is
 risk_measure.
 """
-function calculate_bound(graph::PolicyGraph,
+function calculate_bound(graph::PolicyGraph{T},
                          root_state::Dict{Symbol, Float64} =
                             graph.initial_root_state;
-                         risk_measure = Expectation())
+                         risk_measure = Expectation()
+                         ) where {T}
     # Initialization.
     noise_supports = Any[]
     probabilities = Float64[]
     objectives = Float64[]
-    belief = initialize_belief(graph)
+    current_belief = initialize_belief(graph)
 
     # Solve all problems that are children of the root node.
     for child in graph.root_children
@@ -587,7 +591,7 @@ function calculate_bound(graph::PolicyGraph,
                 belief = node.subproblem.ext[:kokako_belief]::BeliefState{T}
                 partition_index = belief.partition_index
                 belief.updater(
-                    belief.belief, current_belief, partition_index, noise)
+                    belief.belief, current_belief, partition_index, noise.term)
             end
             (outgoing_state, duals, stage_objective, obj) =
                 solve_subproblem(graph, node, root_state, noise.term)
