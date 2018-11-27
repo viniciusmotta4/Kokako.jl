@@ -3,37 +3,40 @@ using Kokako, GLPK, Random, Statistics, Test
 function infinite_belief()
     graph = Kokako.Graph(
         :root_node,
-        [:A, :B],
+        [:Ad, :Ah, :Bd, :Bh],
         [
-            (:root_node => :A, 0.5), (:root_node => :B, 0.5),
-            (:A => :A, 0.7), (:A => :B, 0.2),
-            (:B => :A, 0.2), (:B => :B, 0.7)
+            (:root_node => :Ad, 0.5), (:root_node => :Bd, 0.5),
+            (:Ad => :Ah, 1.0), (:Ah => :Ad, 0.9),
+            (:Bd => :Bh, 1.0), (:Bh => :Bd, 0.9)
         ],
-        belief_partition = [ [:A, :B] ]
+        belief_partition = [ [:Ad, :Bd], [:Ah, :Bh] ]
     )
-
     model = Kokako.PolicyGraph(graph,
                 bellman_function = Kokako.AverageCut(lower_bound = 0.0),
                 optimizer = with_optimizer(GLPK.Optimizer)
                     ) do subproblem, node
         @variables(subproblem, begin
             0 <= inventory <= 3, (Kokako.State, initial_value = 0.0)
-            units_bought >= 0
+            0 <= units_bought <= 3, (Kokako.State, initial_value = 0.0)
             lost_demand >= 0
             destroyed_units >= 0
             demand
         end)
-        @constraint(subproblem, inventory.out == inventory.in - demand +
-            units_bought + lost_demand - destroyed_units)
-        @constraint(subproblem, inventory.in >= demand - lost_demand)
-        @stageobjective(subproblem,
-            units_bought + 2 * destroyed_units + 10 * lost_demand)
-        probabilities = Dict(
-            :A => [0.5, 0.3, 0.2],
-            :B => [0.2, 0.3, 0.5]
-        )
-        Kokako.parameterize(subproblem, [1, 2, 3], probabilities[node]) do ω
-            JuMP.fix(demand, ω)
+        if node == :Ad || node == :Bd
+            @constraint(subproblem, inventory.out == inventory.in)
+            @stageobjective(subproblem, units_bought.out)
+        else
+            @constraint(subproblem, inventory.out == inventory.in +
+                units_bought.in - demand + lost_demand - destroyed_units
+            )
+            @stageobjective(subproblem, 2 * destroyed_units + 10 * lost_demand)
+            probabilities = Dict(
+                :Ah => [0.5, 0.3, 0.2],
+                :Bh => [0.2, 0.3, 0.5]
+            )
+            Kokako.parameterize(subproblem, [1, 2, 3], probabilities[node]) do ω
+                JuMP.fix(demand, ω)
+            end
         end
     end
 end

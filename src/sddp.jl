@@ -69,16 +69,6 @@ function get_same_children(graph::PolicyGraph{T}) where {T}
     return same_children
 end
 
-function build_Φ(graph::PolicyGraph{T}) where {T}
-    Φ = Dict{Tuple{T, T}, Float64}()
-    for (node_index_1, node_1) in graph.nodes
-        for child in node_1.children
-            Φ[(node_index_1, child.term)] = child.probability
-        end
-    end
-    return Φ
-end
-
 # Internal struct: storage for SDDP options and cached data. Users shouldn't
 # interact with this directly.
 struct Options{T}
@@ -247,9 +237,7 @@ end
 # Internal function: calculate the initial belief state.
 function initialize_belief(graph::PolicyGraph{T}) where {T}
     current_belief = Dict{T, Float64}(keys(graph.nodes) .=> 0.0)
-    for child in graph.root_children
-        current_belief[child.term] = child.probability
-    end
+    current_belief[graph.root_node] = 1.0
     return current_belief
 end
 

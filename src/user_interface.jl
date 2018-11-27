@@ -228,6 +228,8 @@ end
 struct PolicyGraph{T}
     # Must be MOI.MinSense or MOI.MaxSense
     objective_sense::MOI.OptimizationSense
+    # Index of the root node.
+    root_node::T
     # Children of the root node. child => probability.
     root_children::Vector{Noise{T}}
     # Starting value of the state variables.
@@ -237,7 +239,7 @@ struct PolicyGraph{T}
     # Belief partition.
     belief_partition::Vector{Set{T}}
 
-    function PolicyGraph(T, sense::Symbol)
+    function PolicyGraph(sense::Symbol, root_node::T) where {T}
         optimization_sense = if sense == :Min
             MOI.MinSense
         elseif sense == :Max
@@ -245,8 +247,8 @@ struct PolicyGraph{T}
         else
             error("The optimization sense must be :Min or :Max. It is $(sense).")
         end
-        return new{T}(optimization_sense, Noise{T}[], Dict{Symbol, Float64}(),
-            Dict{T, Node{T}}(), Set{T}[])
+        return new{T}(optimization_sense, root_node, Noise{T}[],
+            Dict{Symbol, Float64}(), Dict{T, Node{T}}(), Set{T}[])
     end
 end
 
@@ -327,7 +329,7 @@ function PolicyGraph(builder::Function, graph::Graph{T};
     validate_graph(graph)
     # Construct a basic policy graph. We will add to it in the remainder of this
     # function.
-    policy_graph = PolicyGraph(T, sense)
+    policy_graph = PolicyGraph(sense, graph.root_node)
     # Initialize nodes.
     for (node_index, children) in graph.nodes
         if node_index == graph.root_node
@@ -598,6 +600,19 @@ function JuMP.value(state::State{JuMP.VariableRef})
     return State(JuMP.value(state.in), JuMP.value(state.out))
 end
 
+function build_Φ(graph::PolicyGraph{T}) where {T}
+    Φ = Dict{Tuple{T, T}, Float64}()
+    for (node_index_1, node_1) in graph.nodes
+        for child in node_1.children
+            Φ[(node_index_1, child.term)] = child.probability
+        end
+    end
+    for child in graph.root_children
+        Φ[(graph.root_node, child.term)] = child.probability
+    end
+    return Φ
+end
+
 """
     construct_belief_update(graph::PolicyGraph{T}, partition::Vector{Set{T}})
 
@@ -619,7 +634,7 @@ function construct_belief_update(
     # TODO: check that partition is proper.
     # TODO: throw errors for invalid belief? Or do we just assume that we can
     #     never be given an invalid belief.
-    Φ = Kokako.build_Φ(graph)  # Dict{Tuple{T, T}, Float64}
+    Φ = build_Φ(graph)  # Dict{Tuple{T, T}, Float64}
     Ω = Dict{T, Dict{Any, Float64}}()
     for (index, node) in graph.nodes
         Ω[index] = Dict{Any, Float64}()
